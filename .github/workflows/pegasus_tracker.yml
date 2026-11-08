@@ -1,0 +1,85 @@
+name: Pegasus Kampanya Takibi
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      send_test:
+        description: 'Telegram test mesajı gönder (kampanya taraması yapmaz)'
+        type: boolean
+        default: false
+      dry_run:
+        description: 'Kuru çalıştırma: Telegram''a gönderme, state''i değiştirme, sonucu logda göster'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pegasus-tracker
+  cancel-in-progress: false
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    env:
+      PYTHONUNBUFFERED: '1'
+      TZ: Europe/Istanbul
+    steps:
+      - name: Depoyu al
+        uses: actions/checkout@v4
+
+      - name: Python 3.12 kur (pip önbellekli)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Bağımlılıkları kur
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Telegram test mesajı
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.send_test }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python main.py --send-test
+
+      - name: Kuru çalıştırma (dry-run)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && !inputs.send_test }}
+        run: python main.py --dry-run
+
+      - name: Kampanyaları kontrol et
+        if: ${{ !(github.event_name == 'workflow_dispatch' && (inputs.send_test || inputs.dry_run)) }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python main.py
+
+      - name: State değiştiyse commit ve push et
+        if: ${{ always() && !(github.event_name == 'workflow_dispatch' && (inputs.send_test || inputs.dry_run)) }}
+        run: |
+          set -u
+          git config user.name  "pegasus-bot[bot]"
+          git config user.email "pegasus-bot@users.noreply.github.com"
+          if [ -z "$(git status --porcelain -- .state)" ]; then
+            echo "State değişmedi; commit oluşturulmadı."
+            exit 0
+          fi
+          git add .state
+          git commit -m "chore(state): kampanya durumu güncellendi [skip ci]"
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              echo "State push edildi (deneme $attempt)."
+              exit 0
+            fi
+            echo "Push başarısız (deneme $attempt); uzak değişiklikler alınıyor..."
+            git pull --rebase -X theirs origin "${GITHUB_REF_NAME}" || git rebase --abort || true
+            sleep $((attempt * 3))
+          done
+          echo "::error::State push edilemedi. Bir sonraki çalışma aynı değişiklikleri yeniden algılayacak."
+          exit 1
